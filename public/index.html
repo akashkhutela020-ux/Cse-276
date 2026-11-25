@@ -125,22 +125,22 @@
     <!-- KPI Cards -->
     <div class="grid-4" id="kpi-cards">
       <div class="card">
-        <div class="kpi-label">Avg Wait Time Reduction</div>
+        <div class="kpi-label">Live Wait Time Reduction</div>
         <div class="kpi-value" id="kpi-wait">--</div>
         <div class="kpi-sub" id="kpi-wait-sub">Loading...</div>
       </div>
       <div class="card">
-        <div class="kpi-label">Avg Queue Reduction</div>
+        <div class="kpi-label">Live Avg Queue Reduction</div>
         <div class="kpi-value" id="kpi-queue">--</div>
         <div class="kpi-sub" id="kpi-queue-sub">Loading...</div>
       </div>
       <div class="card">
-        <div class="kpi-label">Peak Hours (7-9 AM, 4-6 PM)</div>
+        <div class="kpi-label">Live Max Queue Reduction</div>
         <div class="kpi-value" id="kpi-peak">--</div>
         <div class="kpi-sub" id="kpi-peak-sub">Loading...</div>
       </div>
       <div class="card">
-        <div class="kpi-label">Off-Peak Hours</div>
+        <div class="kpi-label">Live Throughput (1-Hr)</div>
         <div class="kpi-value" id="kpi-offpeak">--</div>
         <div class="kpi-sub" id="kpi-offpeak-sub">Loading...</div>
       </div>
@@ -214,7 +214,10 @@
   <script>
     let modelData = null;
     let liveChart = null;
+    let waitChart = null;
     let animTimer = null;
+    let simAbortCtrl = null;
+    let sliderDebounce = null;
 
     async function init() {
       try {
@@ -230,21 +233,42 @@
       }
     }
 
-    function pct(base, ai) {
-      return (((base - ai) / base) * 100).toFixed(1) + '%';
+    function pctValue(base, ai) {
+      if (!base) return 0;
+      return ((base - ai) / base) * 100;
     }
 
-    function renderKPIs() {
-      const f = modelData.evaluation.fixed;
-      const a = modelData.evaluation.ai;
-      document.getElementById('kpi-wait').textContent = '+' + pct(f.avg_wait_sec, a.avg_wait_sec);
+    function formatSignedPct(val) {
+      return (val >= 0 ? '+' : '') + val.toFixed(1) + '%';
+    }
+
+    function setDeltaText(el, val) {
+      el.textContent = formatSignedPct(val);
+      el.style.color = val >= 0 ? 'var(--green)' : 'var(--orange)';
+    }
+
+    function renderKPIs(liveData = null) {
+      const f = liveData ? liveData.fixed : modelData.evaluation.fixed;
+      const a = liveData ? liveData.ai : modelData.evaluation.ai;
+
+      setDeltaText(document.getElementById('kpi-wait'), pctValue(f.avg_wait_sec, a.avg_wait_sec));
       document.getElementById('kpi-wait-sub').textContent = `${a.avg_wait_sec}s AI vs ${f.avg_wait_sec}s Fixed`;
-      document.getElementById('kpi-queue').textContent = '+' + pct(f.avg_queue, a.avg_queue);
+
+      setDeltaText(document.getElementById('kpi-queue'), pctValue(f.avg_queue, a.avg_queue));
       document.getElementById('kpi-queue-sub').textContent = `${a.avg_queue} veh AI vs ${f.avg_queue} veh Fixed`;
-      document.getElementById('kpi-peak').textContent = '+' + pct(f.peak_avg_wait_sec, a.peak_avg_wait_sec);
-      document.getElementById('kpi-peak-sub').textContent = `${a.peak_avg_wait_sec}s AI vs ${f.peak_avg_wait_sec}s Fixed`;
-      document.getElementById('kpi-offpeak').textContent = '+' + pct(f.offpeak_avg_wait_sec, a.offpeak_avg_wait_sec);
-      document.getElementById('kpi-offpeak-sub').textContent = `${a.offpeak_avg_wait_sec}s AI vs ${f.offpeak_avg_wait_sec}s Fixed`;
+
+      setDeltaText(document.getElementById('kpi-peak'), pctValue(f.max_queue, a.max_queue));
+      document.getElementById('kpi-peak-sub').textContent = `${a.max_queue} veh AI vs ${f.max_queue} veh Fixed`;
+
+      if (liveData) {
+        const tpEl = document.getElementById('kpi-offpeak');
+        tpEl.textContent = `${a.throughput} veh/hr`;
+        tpEl.style.color = 'var(--blue)';
+        document.getElementById('kpi-offpeak-sub').textContent = `Fixed: ${f.throughput} veh/hr • I-94 Benchmark: +91.9%`;
+      } else {
+        document.getElementById('kpi-offpeak').textContent = `${a.throughput_per_hr} veh/hr`;
+        document.getElementById('kpi-offpeak-sub').textContent = `Fixed: ${f.throughput_per_hr} veh/hr`;
+      }
     }
 
     function renderStaticCharts() {
@@ -264,13 +288,13 @@
       });
 
       const f = modelData.evaluation.fixed, a = modelData.evaluation.ai;
-      new Chart(document.getElementById('waitChart'), {
+      waitChart = new Chart(document.getElementById('waitChart'), {
         type: 'bar',
         data: {
-          labels: ['Overall', 'Peak', 'Off-Peak'],
+          labels: ['Live Traffic', 'I-94 Overall', 'I-94 Peak', 'I-94 Off-Peak'],
           datasets: [
-            { label: 'Fixed-Timing (s)', data: [f.avg_wait_sec, f.peak_avg_wait_sec, f.offpeak_avg_wait_sec], backgroundColor: '#f97316' },
-            { label: 'AI Agent (s)', data: [a.avg_wait_sec, a.peak_avg_wait_sec, a.offpeak_avg_wait_sec], backgroundColor: '#22c55e' }
+            { label: 'Fixed-Timing (s)', data: [f.avg_wait_sec, f.avg_wait_sec, f.peak_avg_wait_sec, f.offpeak_avg_wait_sec], backgroundColor: '#f97316' },
+            { label: 'AI Agent (s)', data: [a.avg_wait_sec, a.avg_wait_sec, a.peak_avg_wait_sec, a.offpeak_avg_wait_sec], backgroundColor: '#22c55e' }
           ]
         },
         options: { plugins: { legend: { labels: { color: '#f1f5f9' } } }, scales: { x: { ticks: { color: '#94a3b8' } }, y: { ticks: { color: '#94a3b8' } } } }
@@ -401,11 +425,21 @@
       };
     }
 
+    function scheduleLiveSimulation() {
+      if (sliderDebounce) clearTimeout(sliderDebounce);
+      sliderDebounce = setTimeout(() => {
+        runSimulation();
+      }, 100);
+    }
+
     async function runSimulation() {
       const btn = document.getElementById('run-sim-btn');
       const statusEl = document.getElementById('sim-status');
-      btn.disabled = true;
-      statusEl.textContent = 'Running simulation...';
+      if (simAbortCtrl) simAbortCtrl.abort();
+      const ctrl = new AbortController();
+      simAbortCtrl = ctrl;
+
+      statusEl.textContent = 'Updating live simulation...';
       const ew = Number(document.getElementById('ew-slider').value);
       const ns = Number(document.getElementById('ns-slider').value);
       const hour = Number(document.getElementById('preset-select').value.split(',')[0]);
@@ -415,27 +449,37 @@
         const res = await fetch('/api/simulate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ew_volume: ew, ns_volume: ns, hour, seed: 42 })
+          body: JSON.stringify({ ew_volume: ew, ns_volume: ns, hour, seed: 42 }),
+          signal: ctrl.signal
         });
         if (!res.ok) throw new Error(`API returned ${res.status}`);
         data = await res.json();
-        statusEl.textContent = 'Engine: Python Q-Table API';
+        statusEl.textContent = `Live (Python API) • EW ${ew} / NS ${ns} veh/hr @ ${String(hour).padStart(2, '0')}:00`;
       } catch (err) {
+        if (err.name === 'AbortError') return;
         console.warn('API unavailable, using client-side Q-table fallback:', err);
         data = {
           fixed: runOneHourLocal(ew, ns, hour, 'fixed', 42),
           ai: runOneHourLocal(ew, ns, hour, 'ai', 42)
         };
-        statusEl.textContent = 'Engine: Client-Side Q-Table Fallback';
+        statusEl.textContent = `Live (Client Q-Table) • EW ${ew} / NS ${ns} veh/hr @ ${String(hour).padStart(2, '0')}:00`;
       } finally {
         btn.disabled = false;
+      }
+
+      renderKPIs(data);
+
+      if (waitChart) {
+        waitChart.data.datasets[0].data[0] = data.fixed.avg_wait_sec;
+        waitChart.data.datasets[1].data[0] = data.ai.avg_wait_sec;
+        waitChart.update('none');
       }
 
       document.getElementById('sim-ai-wait').textContent = data.ai.avg_wait_sec + ' s/veh';
       document.getElementById('sim-fix-wait').textContent = data.fixed.avg_wait_sec + ' s/veh';
       document.getElementById('sim-ai-max').textContent = data.ai.max_queue + ' veh';
       document.getElementById('sim-fix-max').textContent = data.fixed.max_queue + ' veh';
-      document.getElementById('sim-imp').textContent = '+' + pct(data.fixed.avg_wait_sec, data.ai.avg_wait_sec);
+      setDeltaText(document.getElementById('sim-imp'), pctValue(data.fixed.avg_wait_sec, data.ai.avg_wait_sec));
 
       const labels = data.ai.timeline.map(p => Math.round(p.sec / 60) + 'm');
       const aiQ = data.ai.timeline.map(p => p.q_ew + p.q_ns);
@@ -485,9 +529,11 @@
 
     document.getElementById('ew-slider').addEventListener('input', e => {
       document.getElementById('ew-val').textContent = e.target.value;
+      scheduleLiveSimulation();
     });
     document.getElementById('ns-slider').addEventListener('input', e => {
       document.getElementById('ns-val').textContent = e.target.value;
+      scheduleLiveSimulation();
     });
     document.getElementById('preset-select').addEventListener('change', e => {
       const [, vol] = e.target.value.split(',').map(Number);
@@ -496,6 +542,7 @@
       const ns = Math.round(vol * 0.4);
       document.getElementById('ns-slider').value = ns;
       document.getElementById('ns-val').textContent = ns;
+      runSimulation();
     });
     document.getElementById('run-sim-btn').addEventListener('click', runSimulation);
 
