@@ -7,9 +7,20 @@ import random
 from http.server import BaseHTTPRequestHandler
 from typing import Dict, List, Tuple
 
-DATA_PATH = os.path.join(os.path.dirname(__file__), "model_data.json")
-with open(DATA_PATH, "r", encoding="utf-8") as f:
-    MODEL_DATA = json.load(f)
+def _load_model_data() -> Dict:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base_dir, "model_data.json"),
+        os.path.join(base_dir, "..", "public", "model_data.json"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    raise FileNotFoundError(f"Could not find model_data.json in {candidates}")
+
+
+MODEL_DATA = _load_model_data()
 
 Q_TABLE = MODEL_DATA["q_table"]
 CFG = MODEL_DATA["config"]
@@ -143,25 +154,38 @@ def run_one_hour(
 
 
 class handler(BaseHTTPRequestHandler):
-    def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length > 0 else b"{}"
-        try:
-            params = json.loads(body.decode("utf-8"))
-        except Exception:
-            params = {}
-
-        ew_vol = float(params.get("ew_volume", 4500))
-        ns_vol = float(params.get("ns_volume", ew_vol * 0.40))
-        hour = int(params.get("hour", 8)) % 24
-        seed = int(params.get("seed", 42))
-
-        fixed_res = run_one_hour(ew_vol, ns_vol, hour, "fixed", seed)
-        ai_res = run_one_hour(ew_vol, ns_vol, hour, "ai", seed)
-
-        resp = json.dumps({"fixed": fixed_res, "ai": ai_res}).encode("utf-8")
-        self.send_response(200)
+    def _send_json(self, status_code: int, payload: Dict) -> None:
+        resp = json.dumps(payload).encode("utf-8")
+        self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(resp)))
         self.end_headers()
         self.wfile.write(resp)
+
+    def do_GET(self) -> None:
+        handler._send_json(
+            self,
+            200,
+            {
+                "status": "ok",
+                "q_table_loaded": bool(Q_TABLE),
+                "config": CFG,
+            },
+        )
+
+    def do_POST(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length > 0 else b"{}"
+            params = json.loads(body.decode("utf-8")) if body else {}
+
+            ew_vol = float(params.get("ew_volume", 4500))
+            ns_vol = float(params.get("ns_volume", ew_vol * 0.40))
+            hour = int(params.get("hour", 8)) % 24
+            seed = int(params.get("seed", 42))
+
+            fixed_res = run_one_hour(ew_vol, ns_vol, hour, "fixed", seed)
+            ai_res = run_one_hour(ew_vol, ns_vol, hour, "ai", seed)
+            handler._send_json(self, 200, {"fixed": fixed_res, "ai": ai_res})
+        except Exception as exc:
+            handler._send_json(self, 500, {"error": str(exc)})

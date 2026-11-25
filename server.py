@@ -9,18 +9,28 @@ PORT = 8000
 PUBLIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "public")
 
 
+class ReusableTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+
 class LocalHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=PUBLIC_DIR, **kwargs)
 
+    def do_GET(self):
+        if self.path.split("?")[0] == "/api/simulate":
+            SimulateHandler.do_GET(self)
+        else:
+            super().do_GET()
+
     def do_POST(self):
-        if self.path == "/api/simulate":
+        if self.path.split("?")[0] == "/api/simulate":
             SimulateHandler.do_POST(self)
         else:
             self.send_error(404)
 
 
 if __name__ == "__main__":
-    with socketserver.TCPServer(("", PORT), LocalHandler) as httpd:
+    with ReusableTCPServer(("", PORT), LocalHandler) as httpd:
         print(f"Serving UI at http://localhost:{PORT}")
         httpd.serve_forever()

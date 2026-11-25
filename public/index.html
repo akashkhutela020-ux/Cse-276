@@ -169,6 +169,7 @@
         </div>
         <div>
           <button id="run-sim-btn">Run 1-Hour Simulation</button>
+          <div id="sim-status" style="font-size:0.75rem;color:var(--muted);margin-top:6px;"></div>
         </div>
       </div>
 
@@ -216,11 +217,17 @@
     let animTimer = null;
 
     async function init() {
-      const res = await fetch('/model_data.json');
-      modelData = await res.json();
-      renderKPIs();
-      renderStaticCharts();
-      runSimulation();
+      try {
+        const res = await fetch('/model_data.json');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        modelData = await res.json();
+        renderKPIs();
+        renderStaticCharts();
+        await runSimulation();
+      } catch (err) {
+        console.error('Initialization failed:', err);
+        document.getElementById('sim-status').textContent = 'Error loading model data: ' + err.message;
+      }
     }
 
     function pct(base, ai) {
@@ -280,20 +287,149 @@
       });
     }
 
+    function seededRng(seed) {
+      let s = seed >>> 0;
+      return () => {
+        s = (s * 1664525 + 1013904223) >>> 0;
+        return s / 4294967296;
+      };
+    }
+
+    function poissonSample(lam, rand) {
+      if (lam <= 0) return 0;
+      const L = Math.exp(-lam);
+      let k = 0, p = 1.0;
+      while (p > L) {
+        k += 1;
+        p *= rand();
+      }
+      return k - 1;
+    }
+
+    function binQueue(q) {
+      if (q <= 3) return 0;
+      if (q <= 10) return 1;
+      if (q <= 25) return 2;
+      return 3;
+    }
+
+    function binHour(hour) {
+      if (hour >= 6 && hour <= 9) return 1;
+      if (hour >= 10 && hour <= 15) return 2;
+      if (hour >= 16 && hour <= 21) return 3;
+      return 0;
+    }
+
+    function runOneHourLocal(ewVol, nsVol, hour, mode, seed) {
+      const rand = seededRng(seed);
+      const cfg = modelData.config;
+      const qTable = modelData.q_table;
+      const stepS = cfg.step_seconds;
+      const yellowS = cfg.yellow_lost_seconds;
+      const satRate = cfg.saturation_rate;
+      const scale = cfg.demand_scale_factor;
+      const minGreen = cfg.min_green_seconds;
+      const maxGreen = cfg.max_green_seconds;
+      const fixedGreen = cfg.fixed_green_seconds;
+
+      const ewRate = (ewVol * scale) / 3600.0;
+      const nsRate = (nsVol * scale) / 3600.0;
+      const steps = Math.floor(3600 / stepS);
+      const hBin = binHour(hour);
+
+      let qEw = 0, qNs = 0, phase = 0, phaseElapsed = 0, carry = 0.0;
+      let totalWaitSec = 0.0, totalQSum = 0, maxQ = 0, departedTotal = 0;
+      const timeline = [];
+
+      for (let s = 0; s < steps; s++) {
+        let action;
+        if (mode === 'fixed') {
+          action = phaseElapsed >= fixedGreen ? 1 : 0;
+        } else if (phaseElapsed < minGreen) {
+          action = 0;
+        } else if (phaseElapsed >= maxGreen) {
+          action = 1;
+        } else {
+          const qVals = qTable[binQueue(qEw)][binQueue(qNs)][phase][hBin];
+          action = qVals[0] >= qVals[1] ? 0 : 1;
+        }
+
+        let effGreen;
+        if (action === 1) {
+          phase = 1 - phase;
+          phaseElapsed = stepS;
+          carry = 0.0;
+          effGreen = stepS - yellowS;
+        } else {
+          phaseElapsed += stepS;
+          effGreen = stepS;
+        }
+
+        qEw += poissonSample(ewRate * stepS, rand);
+        qNs += poissonSample(nsRate * stepS, rand);
+
+        const cap = effGreen * satRate + carry;
+        const maxDep = Math.floor(cap);
+        let dep;
+        if (phase === 0) {
+          dep = Math.min(qEw, maxDep);
+          qEw -= dep;
+          carry = qEw > 0 ? cap - dep : 0.0;
+        } else {
+          dep = Math.min(qNs, maxDep);
+          qNs -= dep;
+          carry = qNs > 0 ? cap - dep : 0.0;
+        }
+
+        const qTot = qEw + qNs;
+        totalQSum += qTot;
+        totalWaitSec += qTot * stepS;
+        departedTotal += dep;
+        if (qTot > maxQ) maxQ = qTot;
+
+        if (s % 6 === 0) {
+          timeline.push({ sec: (s + 1) * stepS, q_ew: qEw, q_ns: qNs, phase, switched: action === 1 });
+        }
+      }
+
+      return {
+        avg_wait_sec: Number((totalWaitSec / Math.max(departedTotal, 1)).toFixed(2)),
+        avg_queue: Number((totalQSum / steps).toFixed(2)),
+        max_queue: maxQ,
+        throughput: departedTotal,
+        timeline
+      };
+    }
+
     async function runSimulation() {
       const btn = document.getElementById('run-sim-btn');
+      const statusEl = document.getElementById('sim-status');
       btn.disabled = true;
+      statusEl.textContent = 'Running simulation...';
       const ew = Number(document.getElementById('ew-slider').value);
       const ns = Number(document.getElementById('ns-slider').value);
       const hour = Number(document.getElementById('preset-select').value.split(',')[0]);
 
-      const res = await fetch('/api/simulate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ew_volume: ew, ns_volume: ns, hour, seed: 42 })
-      });
-      const data = await res.json();
-      btn.disabled = false;
+      let data;
+      try {
+        const res = await fetch('/api/simulate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ew_volume: ew, ns_volume: ns, hour, seed: 42 })
+        });
+        if (!res.ok) throw new Error(`API returned ${res.status}`);
+        data = await res.json();
+        statusEl.textContent = 'Engine: Python Q-Table API';
+      } catch (err) {
+        console.warn('API unavailable, using client-side Q-table fallback:', err);
+        data = {
+          fixed: runOneHourLocal(ew, ns, hour, 'fixed', 42),
+          ai: runOneHourLocal(ew, ns, hour, 'ai', 42)
+        };
+        statusEl.textContent = 'Engine: Client-Side Q-Table Fallback';
+      } finally {
+        btn.disabled = false;
+      }
 
       document.getElementById('sim-ai-wait').textContent = data.ai.avg_wait_sec + ' s/veh';
       document.getElementById('sim-fix-wait').textContent = data.fixed.avg_wait_sec + ' s/veh';
